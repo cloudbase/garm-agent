@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	"sync"
@@ -323,9 +324,9 @@ func (s *Service) Stop() error {
 	return nil
 }
 
-func (s *Service) determineRunnerState() params.RunnerStatus {
+func (s *Service) determineRunnerState(runnerAlive bool) params.RunnerStatus {
 	state := params.RunnerOffline
-	if s.runnerAlive {
+	if runnerAlive {
 		state = params.RunnerIdle
 	}
 
@@ -335,7 +336,7 @@ func (s *Service) determineRunnerState() params.RunnerStatus {
 		return state
 	}
 	if st.JobStarted {
-		if !s.runnerAlive {
+		if !runnerAlive {
 			// We're coming back online and for some reason, we didn't record
 			// that the job was finished, but we did record that the job was started.
 			// If the job was started but the runner is offline, then the job was either
@@ -353,26 +354,54 @@ func (s *Service) determineRunnerState() params.RunnerStatus {
 	return state
 }
 
-func (s *Service) sendRunnerStatus() {
-	agentID := int64(s.runnerCmd.AgentID())
-	state := s.determineRunnerState()
+// snapshot reads the runner's agent ID and liveness under s.mux. ok is false
+// when the runner command has not been created yet (s.runnerCmd is nil), in
+// which case there is no identity to report and callers should skip sending
+// status/heartbeats. Safe to call without holding s.mux; callers that already
+// hold s.mux must read the fields directly, since sync.Mutex is not reentrant.
+func (s *Service) snapshot() (id uint, runnerAlive bool, ok bool) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	if s.runnerCmd == nil {
+		return 0, s.runnerAlive, false
+	}
+	return s.runnerCmd.AgentID(), s.runnerAlive, true
+}
+
+// isRunnerAlive reports whether the runner is currently up, read under s.mux.
+func (s *Service) isRunnerAlive() bool {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	return s.runnerAlive
+}
+
+func (s *Service) sendRunnerStatus(agentID uint, runnerAlive bool) {
+	state := s.determineRunnerState(runnerAlive)
 	status := params.InstanceUpdateMessage{
 		Status:  state,
-		AgentID: &agentID,
 		Message: fmt.Sprintf("Agent update status to: %s", state),
 	}
-	if err := s.sendRunnerStatusMessage(status); err != nil {
+	if err := s.sendRunnerStatusMessage(agentID, status); err != nil {
 		slog.ErrorContext(s.ctx, "failed to send status", "error", err)
 	}
 }
 
-func (s *Service) sendRunnerStatusMessage(status params.InstanceUpdateMessage) error {
+func (s *Service) sendRunnerStatusMessage(agentID uint, status params.InstanceUpdateMessage) error {
+	// GARM's InstanceUpdateMessage carries the agent ID as a signed *int64, so
+	// guard the unsigned->signed conversion against overflow. Real agent IDs
+	// fit comfortably; an out-of-range value indicates a malformed ID.
+	if uint64(agentID) > math.MaxInt64 {
+		return fmt.Errorf("agent ID %d does not fit in int64", agentID)
+	}
+	signedID := int64(agentID)
+	status.AgentID = &signedID
+
 	asJs, err := json.Marshal(status)
 	if err != nil {
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 	msg := messaging.RunnerUpdateMessage{
-		AgentID: uint64(s.runnerCmd.AgentID()),
+		AgentID: uint64(agentID),
 		Payload: asJs,
 	}
 
@@ -392,7 +421,10 @@ func (s *Service) SetRunnerStarted(st bool) {
 	defer s.mux.Unlock()
 
 	s.runnerAlive = st
-	s.sendRunnerStatus()
+	if s.runnerCmd == nil {
+		return
+	}
+	s.sendRunnerStatus(s.runnerCmd.AgentID(), s.runnerAlive)
 }
 
 func (s *Service) SetJobStarted() {
@@ -401,13 +433,14 @@ func (s *Service) SetJobStarted() {
 	if err := s.agentState.SetJobStarted(); err != nil {
 		slog.ErrorContext(s.ctx, "failed to set job started", "error", err)
 	}
-	agentID := int64(s.runnerCmd.AgentID())
+	if s.runnerCmd == nil {
+		return
+	}
 	status := params.InstanceUpdateMessage{
-		AgentID: &agentID,
 		Status:  params.RunnerActive,
 		Message: "runner is now executing a job",
 	}
-	if err := s.sendRunnerStatusMessage(status); err != nil {
+	if err := s.sendRunnerStatusMessage(s.runnerCmd.AgentID(), status); err != nil {
 		slog.ErrorContext(s.ctx, "failed to send status", "error", err)
 	}
 }
@@ -419,20 +452,21 @@ func (s *Service) SetJobFinished() {
 		slog.ErrorContext(s.ctx, "failed to set job finished", "error", err)
 	}
 
-	agentID := int64(s.runnerCmd.AgentID())
+	if s.runnerCmd == nil {
+		return
+	}
 	status := params.InstanceUpdateMessage{
-		AgentID: &agentID,
 		Status:  params.RunnerTerminated,
 		Message: "Job execution has finished",
 	}
-	if err := s.sendRunnerStatusMessage(status); err != nil {
+	if err := s.sendRunnerStatusMessage(s.runnerCmd.AgentID(), status); err != nil {
 		slog.ErrorContext(s.ctx, "failed to send status", "error", err)
 	}
 }
 
-func (s *Service) sendHeartbeat() error {
+func (s *Service) sendHeartbeat(agentID uint) error {
 	msg := messaging.RunnerHeartbetMessage{
-		AgentID: uint64(s.runnerCmd.AgentID()),
+		AgentID: uint64(agentID),
 	}
 
 	agentCap := params.AgentCapabilities{
@@ -470,7 +504,7 @@ func (s *Service) sleepWithCancel(d time.Duration) (shouldQuit bool) {
 
 func (s *Service) keepRunnerAlive() {
 retryCreate:
-	state := s.determineRunnerState()
+	state := s.determineRunnerState(s.isRunnerAlive())
 	if state == params.RunnerTerminated {
 		// no need for this goroutine.
 		return
@@ -487,13 +521,13 @@ retryCreate:
 	s.runnerCmd = runnerCommand
 	s.mux.Unlock()
 	defer func() {
-		if stopErr := s.runnerCmd.Stop(); stopErr != nil {
+		if stopErr := runnerCommand.Stop(); stopErr != nil {
 			slog.ErrorContext(s.ctx, "failed to stop runner command", "error", stopErr)
 		}
 		select {
 		case <-time.After(2 * time.Second):
 			return
-		case <-s.runnerCmd.Wait():
+		case <-runnerCommand.Wait():
 			return
 		}
 	}()
@@ -505,7 +539,7 @@ retryStart:
 		slog.WarnContext(s.ctx, "max retry reached", "max_retries", 5)
 		return
 	}
-	runnerState := s.determineRunnerState()
+	runnerState := s.determineRunnerState(s.isRunnerAlive())
 	if runnerState == params.RunnerTerminated {
 		// we only attepmt to start the runner if we need to. A runner that has already run a job,
 		// should not be started again, even if the agent is still online.
@@ -514,16 +548,14 @@ retryStart:
 	if err := runnerCommand.Start(); err != nil {
 		slog.ErrorContext(s.ctx, "failed to start runner", "error", err)
 		retryCount++
-		runnerState := s.determineRunnerState()
+		runnerState := s.determineRunnerState(s.isRunnerAlive())
 		if runnerState == params.RunnerOffline {
 			// The runner did not run a job as far as we know, but it's failing to start. Send a failed message to GARM.
-			agentID := int64(s.runnerCmd.AgentID())
 			status := params.InstanceUpdateMessage{
-				AgentID: &agentID,
 				Status:  params.RunnerFailed,
-				Message: fmt.Sprintf("Runner failed to start: %s", s.runnerCmd.Error()),
+				Message: fmt.Sprintf("Runner failed to start: %s", runnerCommand.Error()),
 			}
-			if statusErr := s.sendRunnerStatusMessage(status); statusErr != nil {
+			if statusErr := s.sendRunnerStatusMessage(runnerCommand.AgentID(), status); statusErr != nil {
 				slog.ErrorContext(s.ctx, "failed to send runner status", "error", statusErr)
 			}
 		}
@@ -540,8 +572,8 @@ retryStart:
 			return
 		case <-s.ctx.Done():
 			return
-		case <-s.runnerCmd.Wait():
-			if s.determineRunnerState() == params.RunnerTerminated {
+		case <-runnerCommand.Wait():
+			if s.determineRunnerState(s.isRunnerAlive()) == params.RunnerTerminated {
 				return
 			}
 			if s.sleepWithCancel(5 * time.Second) {
@@ -615,10 +647,12 @@ connecting:
 	case <-s.connecting:
 	}
 	// send initial heartbeat
-	if err := s.sendHeartbeat(); err != nil {
-		slog.ErrorContext(s.ctx, "failed to send heartbeat", "error", err)
+	if id, alive, ok := s.snapshot(); ok {
+		if err := s.sendHeartbeat(id); err != nil {
+			slog.ErrorContext(s.ctx, "failed to send heartbeat", "error", err)
+		}
+		s.sendRunnerStatus(id, alive)
 	}
-	s.sendRunnerStatus()
 
 	for {
 		select {
@@ -633,8 +667,10 @@ connecting:
 			goto connecting
 		case <-heartbeatTicker.C:
 			// send heartbeat
-			if err := s.sendHeartbeat(); err != nil {
-				slog.ErrorContext(s.ctx, "failed to send heartbeat", "error", err)
+			if id, _, ok := s.snapshot(); ok {
+				if err := s.sendHeartbeat(id); err != nil {
+					slog.ErrorContext(s.ctx, "failed to send heartbeat", "error", err)
+				}
 			}
 		}
 	}

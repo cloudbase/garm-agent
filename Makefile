@@ -31,7 +31,7 @@ build-static: ## Build garm-agent statically
 	@echo Binaries are available in $(PWD)/build
 
 test:
-	go test -count=1 -v ./...
+	go test -race -count=1 -v ./...
 
 ##@ Build Dependencies
 

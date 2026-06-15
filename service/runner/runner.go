@@ -179,12 +179,18 @@ func (r *runnerCmd) executeCommand() {
 	var stdout, stderr io.ReadCloser
 	var jobStarted bool
 	var jobMux sync.Mutex
+	var scannerWg sync.WaitGroup
 
 	defer func() {
 		r.cmdErr = err
 		if stopErr := r.Stop(); stopErr != nil {
 			slog.ErrorContext(r.ctx, "failed to stop runner", "error", stopErr)
 		}
+		// Wait for scanner goroutines to drain any buffered output before
+		// marking the runner as offline. This ensures that if the process
+		// wrote "Listening for Jobs" just before exiting (or before a child
+		// process was killed), the idle signal reaches GARM before offline.
+		scannerWg.Wait()
 		r.st.SetRunnerStarted(false)
 
 		jobMux.Lock()
@@ -194,7 +200,7 @@ func (r *runnerCmd) executeCommand() {
 		if started {
 			// Job was started and the runner exited. This means that the job reached a conclusion
 			// and we need to remove the runner.
-			slog.InfoContext(r.ctx, "runner has finished th job")
+			slog.InfoContext(r.ctx, "runner has finished the job")
 			r.st.SetJobFinished()
 		}
 	}()
@@ -211,7 +217,9 @@ func (r *runnerCmd) executeCommand() {
 		return
 	}
 
+	scannerWg.Add(2)
 	go func() {
+		defer scannerWg.Done()
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -237,6 +245,7 @@ func (r *runnerCmd) executeCommand() {
 	}()
 
 	go func() {
+		defer scannerWg.Done()
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -268,7 +277,9 @@ func (r *runnerCmd) executeCommand() {
 		return
 	}
 
-	err = r.cmd.Wait()
+	// wait() is the single owner of cmd.Wait(); it reaps the process and signals
+	// cleanup() (via the executor's exited channel) that the process is gone.
+	err = r.executor.wait()
 	if err != nil {
 		slog.ErrorContext(r.ctx, "command failed", "error", err)
 		return

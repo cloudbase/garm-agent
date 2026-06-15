@@ -16,6 +16,13 @@ type platformExecutor struct {
 	cmd  *exec.Cmd
 	job  windows.Handle
 	once sync.Once
+
+	// wait() is the single owner of cmd.Wait(); waitOnce guards it and waitErr
+	// caches its result. Mirrors the Unix executor so the shared executeCommand
+	// can call executor.wait() on every platform.
+	waitOnce sync.Once
+	waitErr  error
+	exited   chan struct{}
 }
 
 // setupCommand configures the command for Windows with job object support
@@ -41,9 +48,21 @@ func setupCommand(cmd *exec.Cmd) (*platformExecutor, error) {
 	cmd.SysProcAttr.CreationFlags = windows.CREATE_NEW_PROCESS_GROUP
 
 	return &platformExecutor{
-		cmd: cmd,
-		job: job,
+		cmd:    cmd,
+		job:    job,
+		exited: make(chan struct{}),
 	}, nil
+}
+
+// wait reaps the process exactly once and signals its exit. It is the single
+// owner of cmd.Wait(), mirroring the Unix executor so the shared executeCommand
+// can call executor.wait() regardless of platform.
+func (e *platformExecutor) wait() error {
+	e.waitOnce.Do(func() {
+		e.waitErr = e.cmd.Wait()
+		close(e.exited)
+	})
+	return e.waitErr
 }
 
 // startCommand starts the process and assigns it to the job object

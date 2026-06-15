@@ -16,6 +16,13 @@ import (
 type platformExecutor struct {
 	cmd  *exec.Cmd
 	once sync.Once
+
+	// wait() is the single owner of cmd.Wait(). waitOnce guards it, waitErr
+	// caches its result, and exited is closed once the process has been reaped
+	// so cleanup() can wait on the real exit instead of probing the PID.
+	waitOnce sync.Once
+	waitErr  error
+	exited   chan struct{}
 }
 
 // setupCommand configures the command for Unix/Linux with process group support
@@ -30,7 +37,8 @@ func setupCommand(cmd *exec.Cmd) (*platformExecutor, error) {
 	cmd.SysProcAttr.Pgid = 0
 
 	return &platformExecutor{
-		cmd: cmd,
+		cmd:    cmd,
+		exited: make(chan struct{}),
 	}, nil
 }
 
@@ -40,6 +48,18 @@ func (e *platformExecutor) startCommand() error {
 		return fmt.Errorf("failed to start process: %w", err)
 	}
 	return nil
+}
+
+// wait reaps the process exactly once and signals its exit. It is the single
+// owner of cmd.Wait(): executeCommand calls it, and cleanup() blocks on the
+// exited channel it closes. Calling cmd.Wait() from more than one place returns
+// an immediate "Wait was already called" error and races the reaper.
+func (e *platformExecutor) wait() error {
+	e.waitOnce.Do(func() {
+		e.waitErr = e.cmd.Wait()
+		close(e.exited)
+	})
+	return e.waitErr
 }
 
 // cleanup terminates all processes in the process group
@@ -64,26 +84,27 @@ func (e *platformExecutor) cleanup() error {
 			}
 		}
 
-		// Wait briefly for graceful exit
-		done := make(chan error, 1)
-		go func() {
-			done <- e.cmd.Wait()
-		}()
-
+		// Wait for graceful exit, keying off the real process exit (exited is
+		// closed by wait(), the single cmd.Wait() owner) rather than re-calling
+		// cmd.Wait() or probing the PID. Probing a raw PID is unsafe: once the
+		// process is reaped its PID can be recycled, so a liveness probe could
+		// read a stranger as "alive" and the SIGKILL below could hit an
+		// unrelated process group.
 		select {
-		case <-done:
-			// Process exited gracefully
+		case <-e.exited:
+			// Process exited gracefully and has been reaped; nothing more to do.
+			return
 		case <-time.After(2000 * time.Millisecond):
-			// Force kill if it didn't exit gracefully
-			// Send SIGKILL to the process group
-			if killErr := syscall.Kill(-pid, syscall.SIGKILL); killErr != nil {
-				slog.Warn("failed to send SIGKILL to process group", "error", killErr, "pid", pid)
-				// If process group kill fails, try killing just the process
-				if killErr := syscall.Kill(pid, syscall.SIGKILL); killErr != nil {
-					err = fmt.Errorf("failed to send SIGKILL to process: %w", killErr)
-				}
+		}
+
+		// Grace period elapsed and the process is still running — exited is not
+		// closed, so its PID cannot have been reused. Force kill the whole group.
+		if killErr := syscall.Kill(-pid, syscall.SIGKILL); killErr != nil {
+			slog.Warn("failed to send SIGKILL to process group", "error", killErr, "pid", pid)
+			// If process group kill fails, try killing just the process
+			if killErr := syscall.Kill(pid, syscall.SIGKILL); killErr != nil {
+				err = fmt.Errorf("failed to send SIGKILL to process: %w", killErr)
 			}
-			<-done // Wait for the process to actually exit
 		}
 	})
 	return err

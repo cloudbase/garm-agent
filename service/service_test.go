@@ -303,10 +303,9 @@ func TestServiceDetermineRunnerState(t *testing.T) {
 			defer newState.Close()
 			service.agentState = newState
 
-			service.runnerAlive = tt.runnerAlive
 			tt.setupState()
 
-			state := service.determineRunnerState()
+			state := service.determineRunnerState(tt.runnerAlive)
 			if state != tt.expectedState {
 				t.Errorf("expected state %v, got %v", tt.expectedState, state)
 			}
