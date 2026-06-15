@@ -67,6 +67,11 @@ type Service struct {
 	cliMux  sync.Mutex
 	running bool
 	done    chan struct{}
+	// wg tracks the keepAliveLoop, loop and keepRunnerAlive goroutines so that
+	// shutdown can wait for them to finish — in particular the runner cleanup in
+	// keepRunnerAlive that terminates the runner's process group — before the
+	// process exits and orphans the runner.
+	wg sync.WaitGroup
 
 	connecting chan struct{}
 	connected  chan struct{}
@@ -76,6 +81,15 @@ type Service struct {
 
 func (s *Service) Done() chan struct{} {
 	return s.done
+}
+
+// Wait blocks until the service's goroutines have exited. This includes the
+// runner cleanup in keepRunnerAlive that terminates the runner's process group,
+// so callers should Wait after Done() fires to ensure the runner is torn down
+// before the process exits. The goroutines all return on ctx cancellation or
+// Stop(), so Wait does not block indefinitely.
+func (s *Service) Wait() {
+	s.wg.Wait()
 }
 
 func (s *Service) getClient() (*garmWs.Reader, error) {
@@ -301,6 +315,7 @@ func (s *Service) Start() error {
 
 	s.running = true
 	s.done = make(chan struct{})
+	s.wg.Add(3)
 	go s.keepAliveLoop()
 	go s.loop()
 	go s.keepRunnerAlive()
@@ -503,6 +518,7 @@ func (s *Service) sleepWithCancel(d time.Duration) (shouldQuit bool) {
 }
 
 func (s *Service) keepRunnerAlive() {
+	defer s.wg.Done()
 retryCreate:
 	state := s.determineRunnerState(s.isRunnerAlive())
 	if state == params.RunnerTerminated {
@@ -585,6 +601,7 @@ retryStart:
 }
 
 func (s *Service) keepAliveLoop() {
+	defer s.wg.Done()
 	var sleepTime time.Duration
 retryConnecting:
 	if sleepTime > 0 {
@@ -629,6 +646,7 @@ retryConnecting:
 }
 
 func (s *Service) loop() {
+	defer s.wg.Done()
 	heartbeatTicker := time.NewTicker(30 * time.Second)
 	defer func() {
 		slog.InfoContext(s.ctx, "daemon is shutting down")

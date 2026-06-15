@@ -10,7 +10,6 @@ func (s *Service) Execute(args []string, r <-chan svc.ChangeRequest, status chan
 	if err := s.Start(); err != nil {
 		return false, 11
 	}
-	defer s.Stop()
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
 	status <- svc.Status{State: svc.StartPending}
 
@@ -39,5 +38,11 @@ loop:
 	}
 
 	status <- svc.Status{State: svc.StopPending}
+	if stopErr := s.Stop(); stopErr != nil {
+		slog.ErrorContext(s.ctx, "failed to stop service", "error", stopErr)
+	}
+	// Wait for the service goroutines (including the runner cleanup) to finish
+	// before reporting the service stopped.
+	s.Wait()
 	return false, 0
 }
