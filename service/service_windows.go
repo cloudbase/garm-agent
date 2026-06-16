@@ -46,6 +46,7 @@ loop:
 	// Wait for the service goroutines (including the runner cleanup) to finish
 	// before reporting the service stopped.
 	s.Wait()
+	s.Close()
 	if !scmRequested {
 		// The loop exited because of an internal failure (ctx canceled or done
 		// closed), not an SCM Stop/Shutdown. Return non-zero so the SCM's

@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/cloudbase/garm/params"
 )
@@ -116,7 +117,7 @@ func (r GitHubRunnerConfig) GetAgentName() string {
 }
 
 func (r GitHubRunnerConfig) IsEphemeral() bool {
-	return r.Ephemeral == "True"
+	return strings.EqualFold(r.Ephemeral, "true")
 }
 
 func (r GitHubRunnerConfig) GetServerURL() string {

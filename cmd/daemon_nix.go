@@ -20,5 +20,6 @@ func runService(service *service.Service) error {
 	// Wait for the service goroutines to finish so the runner's process group is
 	// torn down before we exit; otherwise the runner is orphaned on shutdown.
 	service.Wait()
+	service.Close()
 	return nil
 }

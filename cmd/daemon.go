@@ -15,8 +15,8 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -46,7 +46,7 @@ var daemonCmd = &cobra.Command{
 
 		cfg, err := config.NewConfig(agentConfig)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
 		opts := slog.HandlerOptions{
@@ -59,8 +59,9 @@ var daemonCmd = &cobra.Command{
 		} else {
 			fd, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
 			if err != nil {
-				log.Fatal(err)
+				return fmt.Errorf("failed to open log file: %w", err)
 			}
+			defer fd.Close()
 			logDestination = fd
 		}
 		fileHan := slog.NewTextHandler(logDestination, &opts)
@@ -71,10 +72,7 @@ var daemonCmd = &cobra.Command{
 			return err
 		}
 
-		if err := runService(svc); err != nil {
-			return err
-		}
-		return nil
+		return runService(svc)
 	},
 }
 
