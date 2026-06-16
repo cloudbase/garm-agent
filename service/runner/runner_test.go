@@ -52,40 +52,11 @@ func TestValidateCmdParams(t *testing.T) {
 			errorMsg:    "executable path must be absolute",
 		},
 		{
-			name:        "semicolon in argument",
-			cmdParams:   []string{"/usr/bin/runner", "arg1;rm -rf /"},
-			expectError: true,
-			errorMsg:    "contains potentially dangerous characters",
-		},
-		{
-			name:        "pipe in argument",
-			cmdParams:   []string{"/usr/bin/runner", "arg1|cat"},
-			expectError: true,
-			errorMsg:    "contains potentially dangerous characters",
-		},
-		{
-			name:        "ampersand in argument",
-			cmdParams:   []string{"/usr/bin/runner", "arg1&"},
-			expectError: true,
-			errorMsg:    "contains potentially dangerous characters",
-		},
-		{
-			name:        "redirect in argument",
-			cmdParams:   []string{"/usr/bin/runner", "arg1>file"},
-			expectError: true,
-			errorMsg:    "contains potentially dangerous characters",
-		},
-		{
-			name:        "dollar sign in argument",
-			cmdParams:   []string{"/usr/bin/runner", "$HOME"},
-			expectError: true,
-			errorMsg:    "contains potentially dangerous characters",
-		},
-		{
-			name:        "backtick in argument",
-			cmdParams:   []string{"/usr/bin/runner", "`whoami`"},
-			expectError: true,
-			errorMsg:    "contains potentially dangerous characters",
+			// exec.Command does not use a shell, so metacharacters are harmless
+			// and must not be rejected (they can appear in legitimate args).
+			name:        "shell metacharacters are accepted",
+			cmdParams:   []string{"/usr/bin/runner", "arg1;rm", "arg1|cat", "arg1&", "arg1>file", "$HOME", "`whoami`"},
+			expectError: false,
 		},
 		{
 			name:        "valid with dashes and equals",

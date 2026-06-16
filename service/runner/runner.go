@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/cloudbase/garm/params"
@@ -21,23 +20,17 @@ func init() {
 	close(doneChan)
 }
 
-// validateCmdParams validates command parameters to prevent command injection
+// validateCmdParams validates command parameters. exec.Command does not invoke
+// a shell, so metacharacters have no special meaning and are not checked — the
+// only requirement is that the executable path is absolute.
 func validateCmdParams(cmdParams []string) error {
 	if len(cmdParams) == 0 {
 		return fmt.Errorf("cmdParams is empty")
 	}
 
-	// Validate the executable path must be absolute
 	execPath := cmdParams[0]
 	if !filepath.IsAbs(execPath) {
 		return fmt.Errorf("executable path must be absolute: %s", execPath)
-	}
-
-	// Validate arguments don't contain dangerous shell metacharacters
-	for i, arg := range cmdParams {
-		if strings.ContainsAny(arg, ";|&<>$`") {
-			return fmt.Errorf("argument %d contains potentially dangerous characters: %s", i, arg)
-		}
 	}
 
 	return nil
@@ -58,10 +51,6 @@ func NewRunnerCommand(ctx context.Context, cmdParams []string, workdir string, f
 		return nil, fmt.Errorf("workdir %s is not a folder", workdir)
 	}
 
-	if err := os.Chdir(workdir); err != nil {
-		return nil, fmt.Errorf("failed to chdir to %s: %w", workdir, err)
-	}
-
 	if st == nil {
 		return nil, fmt.Errorf("invalid state manager")
 	}
@@ -73,6 +62,7 @@ func NewRunnerCommand(ctx context.Context, cmdParams []string, workdir string, f
 
 	// #nosec G204 - cmdParams validated above for security
 	command := exec.Command(cmdParams[0], cmdParams[1:]...)
+	command.Dir = workdir
 
 	// Set up platform-specific process management
 	executor, err := setupCommand(command)
@@ -135,6 +125,7 @@ func (r *runnerCmd) Start() error {
 	// Recreate the command to avoid "Stdout already set" errors on retry
 	// #nosec G204 - cmdParams validated during NewRunnerCommand
 	r.cmd = exec.Command(r.cmdParams[0], r.cmdParams[1:]...)
+	r.cmd.Dir = r.workdir
 
 	// Set up platform-specific process management
 	executor, err := setupCommand(r.cmd)

@@ -74,25 +74,29 @@ func (e *platformExecutor) cleanup() error {
 
 		pid := e.cmd.Process.Pid
 
-		// Send SIGTERM to the process group for graceful shutdown
-		// Use negative PID to signal the entire process group
+		// If the process has already been reaped (the common path — cleanup
+		// runs from executeCommand's defer after wait() returned), skip
+		// signalling entirely. Sending signals to a reaped PID is harmless
+		// but noisy, and the PID could theoretically have been recycled.
+		select {
+		case <-e.exited:
+			return
+		default:
+		}
+
+		// Process is still alive; ask it to shut down gracefully.
 		if killErr := syscall.Kill(-pid, syscall.SIGTERM); killErr != nil {
 			slog.Warn("failed to send SIGTERM to process group", "error", killErr, "pid", pid)
-			// If process group kill fails, try killing just the process
 			if killErr := syscall.Kill(pid, syscall.SIGTERM); killErr != nil {
 				slog.Warn("failed to send SIGTERM to process", "error", killErr, "pid", pid)
 			}
 		}
 
 		// Wait for graceful exit, keying off the real process exit (exited is
-		// closed by wait(), the single cmd.Wait() owner) rather than re-calling
-		// cmd.Wait() or probing the PID. Probing a raw PID is unsafe: once the
-		// process is reaped its PID can be recycled, so a liveness probe could
-		// read a stranger as "alive" and the SIGKILL below could hit an
-		// unrelated process group.
+		// closed by wait(), the single cmd.Wait() owner) rather than probing the
+		// PID — a reaped PID can be recycled.
 		select {
 		case <-e.exited:
-			// Process exited gracefully and has been reaped; nothing more to do.
 			return
 		case <-time.After(2000 * time.Millisecond):
 		}
