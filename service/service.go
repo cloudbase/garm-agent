@@ -104,6 +104,14 @@ func (s *Service) Wait() {
 	s.wg.Wait()
 }
 
+// Close releases resources held by the service (currently the state DB).
+// Call it after Wait returns.
+func (s *Service) Close() {
+	if s.agentState != nil {
+		s.agentState.Close()
+	}
+}
+
 func (s *Service) getClient() (*garmWs.Reader, error) {
 	s.cliMux.Lock()
 	cli := s.cli
@@ -160,6 +168,13 @@ func (s *Service) handleCreateShell(agentMsg messaging.AgentMessage) (err error)
 		return fmt.Errorf("failed to parse session ID")
 	}
 	s.mux.Lock()
+	if len(s.sessions) >= s.cfg.MaxShellSessions {
+		s.mux.Unlock()
+		if msgErr := s.sendReadyMessage(createShell.SessionID, 1, fmt.Appendf(nil, "max shell sessions (%d) reached", s.cfg.MaxShellSessions)); msgErr != nil {
+			slog.ErrorContext(s.ctx, "failed to send error message", "error", msgErr)
+		}
+		return fmt.Errorf("max shell sessions (%d) reached", s.cfg.MaxShellSessions)
+	}
 	if _, ok := s.sessions[sessionID]; ok {
 		s.mux.Unlock()
 		if msgErr := s.sendReadyMessage(createShell.SessionID, 1, fmt.Appendf(nil, "session ID %s already exists", sessionID)); msgErr != nil {

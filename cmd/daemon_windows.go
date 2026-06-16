@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"time"
 	"unsafe"
 
@@ -27,7 +28,7 @@ func runService(service *service.Service) error {
 	}
 
 	if isService {
-		if err := svc.Run("garm-agent", service); err != nil {
+		if err := svc.Run(serviceName, service); err != nil {
 			return fmt.Errorf("failed to run service: %w", err)
 		}
 	} else {
@@ -92,6 +93,9 @@ func registerService(serviceName, configFile string) error {
 	}
 	lpInfo := serviceFailureActions{ResetPeriod: uint32(24 * time.Hour / time.Second), ActionsCount: uint32(3), Actions: uintptr(unsafe.Pointer(&t[0]))}
 	err = windows.ChangeServiceConfig2(s.Handle, serviceConfigFailureActions, (*byte)(unsafe.Pointer(&lpInfo)))
+	// Keep t alive across the syscall so the GC cannot collect the backing
+	// array while ChangeServiceConfig2 is reading through the uintptr.
+	runtime.KeepAlive(t)
 	if err != nil {
 		return err
 	}

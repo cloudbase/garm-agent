@@ -212,9 +212,10 @@ func (r *runnerCmd) executeCommand() {
 	go func() {
 		defer scannerWg.Done()
 		scanner := bufio.NewScanner(stdout)
+
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			slog.InfoContext(r.ctx, string(line))
+			slog.DebugContext(r.ctx, string(line))
 			if r.isJobStartedLine(line) {
 				slog.InfoContext(r.ctx, "runner is active")
 				r.st.SetJobStarted()
@@ -238,9 +239,10 @@ func (r *runnerCmd) executeCommand() {
 	go func() {
 		defer scannerWg.Done()
 		scanner := bufio.NewScanner(stderr)
+
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			slog.InfoContext(r.ctx, string(line))
+			slog.DebugContext(r.ctx, string(line))
 			if r.isJobStartedLine(line) {
 				slog.InfoContext(r.ctx, "runner is active")
 				r.st.SetJobStarted()

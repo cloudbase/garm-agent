@@ -53,6 +53,9 @@ type Agent struct {
 	//
 	// The parent folder must allow tha agent process write access and expected to persist across reboots.
 	StateDBPath string `toml:"state_db_path"`
+	// MaxShellSessions is the maximum number of concurrent remote shell sessions.
+	// Defaults to 5 if not set or zero.
+	MaxShellSessions int `toml:"max_shell_sessions"`
 }
 
 func (a *Agent) Validate() error {
@@ -72,9 +75,17 @@ func (a *Agent) Validate() error {
 		return fmt.Errorf("runner_cmdline is not set")
 	}
 
+	if a.MaxShellSessions <= 0 {
+		a.MaxShellSessions = 5
+	}
+
 	return nil
 }
 
+// TokenClaims decodes the JWT payload to read the agent's claims (IsAgent,
+// ForgeType, etc.). The signature is intentionally not verified: the agent does
+// not hold the server's signing key, and GARM validates the token
+// authoritatively when the agent presents it over the websocket.
 func (a *Agent) TokenClaims() (auth.InstanceJWTClaims, error) {
 	claims := auth.InstanceJWTClaims{}
 	_, err := jwt.ParseWithClaims(a.Token, &claims, nil)
