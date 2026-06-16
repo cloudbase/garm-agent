@@ -80,29 +80,43 @@ func (sm *Manager) GetState() (State, error) {
 }
 
 func (sm *Manager) SetJobStarted() error {
-	state, err := sm.GetState()
-	if err != nil {
-		return err
-	}
-
-	now := time.Now()
-	state.JobStarted = true
-	state.StartTime = &now
-
-	return sm.SetState(state)
+	return sm.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(sm.bucket)
+		var state State
+		if data := b.Get([]byte("current")); data != nil {
+			if err := json.Unmarshal(data, &state); err != nil {
+				return fmt.Errorf("failed to unmarshal state: %w", err)
+			}
+		}
+		now := time.Now()
+		state.JobStarted = true
+		state.StartTime = &now
+		data, err := json.Marshal(state)
+		if err != nil {
+			return fmt.Errorf("failed to marshal state: %w", err)
+		}
+		return b.Put([]byte("current"), data)
+	})
 }
 
 func (sm *Manager) SetJobFinished() error {
-	state, err := sm.GetState()
-	if err != nil {
-		return err
-	}
-
-	now := time.Now()
-	state.JobFinished = true
-	state.FinishTime = &now
-
-	return sm.SetState(state)
+	return sm.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(sm.bucket)
+		var state State
+		if data := b.Get([]byte("current")); data != nil {
+			if err := json.Unmarshal(data, &state); err != nil {
+				return fmt.Errorf("failed to unmarshal state: %w", err)
+			}
+		}
+		now := time.Now()
+		state.JobFinished = true
+		state.FinishTime = &now
+		data, err := json.Marshal(state)
+		if err != nil {
+			return fmt.Errorf("failed to marshal state: %w", err)
+		}
+		return b.Put([]byte("current"), data)
+	})
 }
 
 func (sm *Manager) IsJobStarted() (bool, error) {

@@ -39,6 +39,15 @@ func NewService(ctx context.Context, cfg *config.Agent) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create state manager: %w", err)
 	}
+	hasShell := cfg.EnableShell && HasPTY()
+	if hasShell {
+		parsed, _ := url.Parse(cfg.ServerURL)
+		if parsed == nil || (parsed.Scheme != "https" && parsed.Scheme != "wss") {
+			slog.WarnContext(ctx, "shell disabled: enable_shell requires a secure (wss/https) server URL")
+			hasShell = false
+		}
+	}
+
 	return &Service{
 		ctx:        ctx,
 		cfg:        cfg,
@@ -47,7 +56,7 @@ func NewService(ctx context.Context, cfg *config.Agent) (*Service, error) {
 		connected:  closed,
 		forgeType:  forgeType,
 		sessions:   make(map[string]*ShellSession),
-		hasShell:   cfg.EnableShell && HasPTY(),
+		hasShell:   hasShell,
 		agentState: agentState,
 	}, nil
 }
@@ -304,15 +313,12 @@ func (s *Service) Start() error {
 	}
 
 	if s.cfg.WorkDir != "" {
-		if mode, err := os.Stat(s.cfg.WorkDir); err == nil {
-			if mode.IsDir() {
-				if chdirErr := os.Chdir(s.cfg.WorkDir); chdirErr != nil {
-					slog.ErrorContext(s.ctx, "failed to change directory", "work_dir", s.cfg.WorkDir, "error", chdirErr)
-				}
-			}
-		} else {
-			slog.ErrorContext(s.ctx, "failed to access work_dir", "work_dir", s.cfg.WorkDir, "error", err)
-			return err
+		info, err := os.Stat(s.cfg.WorkDir)
+		if err != nil {
+			return fmt.Errorf("failed to access work_dir: %w", err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("work_dir %s is not a directory", s.cfg.WorkDir)
 		}
 	}
 

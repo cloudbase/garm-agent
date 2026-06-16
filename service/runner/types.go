@@ -10,12 +10,19 @@ import (
 	"github.com/cloudbase/garm/params"
 )
 
+// These patterns match state-transition lines in the runner's stdout/stderr.
+// They are intentionally unanchored (no ^/$) because the exact log-line prefix
+// differs across runner versions and may include timestamps. The leading/trailing
+// .* that were here previously were redundant — Go's regexp does substring
+// matching already. A false positive (e.g. a job step echoing "Running job:")
+// is theoretically possible but unlikely in practice since the runner does not
+// forward job-step output on its own stdout.
 var (
-	giteaJobStartedRegex  = regexp.MustCompile(".*task [0-9]+ repo is .*")
-	githubJobStartedRegex = regexp.MustCompile(".* Running job: .*")
+	giteaJobStartedRegex  = regexp.MustCompile(`task [0-9]+ repo is `)
+	githubJobStartedRegex = regexp.MustCompile(` Running job: `)
 
-	githubListenForJobs = regexp.MustCompile("Listening for Jobs")
-	giteaListenForJobs  = regexp.MustCompile("runner: .*, declare successfully")
+	githubListenForJobs = regexp.MustCompile(`Listening for Jobs`)
+	giteaListenForJobs  = regexp.MustCompile(`runner: .*, declare successfully`)
 )
 
 type Worker interface {
@@ -82,6 +89,9 @@ func NewRunnerConfig(cfg string, forgeType params.EndpointType) (Config, error) 
 		runCfg = githubCfg
 	default:
 		return nil, fmt.Errorf("unknown forge type %s", forgeType)
+	}
+	if runCfg.GetAgentID() == 0 {
+		return nil, fmt.Errorf("runner config has no valid agent ID (parsed as 0)")
 	}
 	return runCfg, nil
 }

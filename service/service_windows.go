@@ -17,6 +17,7 @@ func (s *Service) Execute(args []string, r <-chan svc.ChangeRequest, status chan
 
 	status <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
+	scmRequested := false
 loop:
 	for {
 		select {
@@ -26,6 +27,7 @@ loop:
 				status <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
 				slog.InfoContext(s.ctx, "service is stopping")
+				scmRequested = true
 				break loop
 			default:
 				slog.InfoContext(s.ctx, "Unexpected control request", "request", c.Cmd)
@@ -44,5 +46,11 @@ loop:
 	// Wait for the service goroutines (including the runner cleanup) to finish
 	// before reporting the service stopped.
 	s.Wait()
+	if !scmRequested {
+		// The loop exited because of an internal failure (ctx canceled or done
+		// closed), not an SCM Stop/Shutdown. Return non-zero so the SCM's
+		// configured failure-actions (e.g. restart) kick in.
+		return false, 1
+	}
 	return false, 0
 }
