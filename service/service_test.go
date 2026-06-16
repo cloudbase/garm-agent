@@ -2,10 +2,15 @@ package service
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/cloudbase/garm-agent/config"
 	"github.com/cloudbase/garm/params"
@@ -438,4 +443,73 @@ func indexOf(s, substr string) int {
 		}
 	}
 	return -1
+}
+
+// TestServiceReconnect drives the keepAliveLoop/loop connect handshake against a
+// real websocket server: it connects, the server drops the connection, and the
+// agent must reconnect. Run under -race, it exercises the connecting/connected
+// and cli synchronization.
+func TestServiceReconnect(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	conns := make(chan *websocket.Conn, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		conns <- c
+		for {
+			if _, _, err := c.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := &Service{
+		ctx:        ctx,
+		cfg:        &config.Agent{ServerURL: wsURL, Token: "test-token"},
+		done:       make(chan struct{}),
+		connecting: make(chan struct{}),
+		connected:  closed,
+		running:    true,
+	}
+	s.wg.Add(2)
+	go s.keepAliveLoop()
+	go s.loop()
+
+	waitConn := func(what string) *websocket.Conn {
+		t.Helper()
+		select {
+		case c := <-conns:
+			return c
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatalf("timed out waiting for the agent to %s", what)
+			return nil
+		}
+	}
+
+	c1 := waitConn("connect")
+	// Drop the connection from the server side; the agent should reconnect.
+	c1.Close()
+	waitConn("reconnect")
+
+	// Shut down and make sure both goroutines exit.
+	cancel()
+	stopped := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("service goroutines did not exit after shutdown")
+	}
 }

@@ -67,7 +67,15 @@ type Service struct {
 	cliMux  sync.Mutex
 	running bool
 	done    chan struct{}
+	// wg tracks the keepAliveLoop, loop and keepRunnerAlive goroutines so that
+	// shutdown can wait for them to finish — in particular the runner cleanup in
+	// keepRunnerAlive that terminates the runner's process group — before the
+	// process exits and orphans the runner.
+	wg sync.WaitGroup
 
+	// connMux guards the connecting/connected handshake channels, which are
+	// closed and re-created from both keepAliveLoop and loop.
+	connMux    sync.Mutex
 	connecting chan struct{}
 	connected  chan struct{}
 
@@ -76,6 +84,15 @@ type Service struct {
 
 func (s *Service) Done() chan struct{} {
 	return s.done
+}
+
+// Wait blocks until the service's goroutines have exited. This includes the
+// runner cleanup in keepRunnerAlive that terminates the runner's process group,
+// so callers should Wait after Done() fires to ensure the runner is torn down
+// before the process exits. The goroutines all return on ctx cancellation or
+// Stop(), so Wait does not block indefinitely.
+func (s *Service) Wait() {
+	s.wg.Wait()
 }
 
 func (s *Service) getClient() (*garmWs.Reader, error) {
@@ -301,6 +318,7 @@ func (s *Service) Start() error {
 
 	s.running = true
 	s.done = make(chan struct{})
+	s.wg.Add(3)
 	go s.keepAliveLoop()
 	go s.loop()
 	go s.keepRunnerAlive()
@@ -318,9 +336,12 @@ func (s *Service) Stop() error {
 
 	close(s.done)
 	s.running = false
+
+	s.cliMux.Lock()
 	if s.cli != nil {
 		s.cli.Stop()
 	}
+	s.cliMux.Unlock()
 	return nil
 }
 
@@ -503,6 +524,7 @@ func (s *Service) sleepWithCancel(d time.Duration) (shouldQuit bool) {
 }
 
 func (s *Service) keepRunnerAlive() {
+	defer s.wg.Done()
 retryCreate:
 	state := s.determineRunnerState(s.isRunnerAlive())
 	if state == params.RunnerTerminated {
@@ -584,7 +606,28 @@ retryStart:
 	}
 }
 
+// connectionUp is called by keepAliveLoop once a websocket connection is
+// established: it re-arms the connected channel (so the next select blocks until
+// the connection drops) and closes connecting to wake loop().
+func (s *Service) connectionUp() {
+	s.connMux.Lock()
+	defer s.connMux.Unlock()
+	s.connected = make(chan struct{})
+	close(s.connecting)
+}
+
+// connectionDown is called by loop() when the connection drops: it re-arms the
+// connecting channel and closes connected to wake keepAliveLoop() for a
+// reconnect.
+func (s *Service) connectionDown() {
+	s.connMux.Lock()
+	defer s.connMux.Unlock()
+	s.connecting = make(chan struct{})
+	close(s.connected)
+}
+
 func (s *Service) keepAliveLoop() {
+	defer s.wg.Done()
 	var sleepTime time.Duration
 retryConnecting:
 	if sleepTime > 0 {
@@ -593,12 +636,15 @@ retryConnecting:
 		}
 	}
 	for {
+		s.connMux.Lock()
+		connected := s.connected
+		s.connMux.Unlock()
 		select {
 		case <-s.done:
 			return
 		case <-s.ctx.Done():
 			return
-		case <-s.connected:
+		case <-connected:
 			slog.InfoContext(s.ctx, "attempting to connect to GARM server", "server", s.cfg.ServerURL)
 			sleepTime = 5 * time.Second
 			parsed, err := url.ParseRequestURI(s.cfg.ServerURL)
@@ -617,18 +663,18 @@ retryConnecting:
 			s.cli = cli
 			s.cliMux.Unlock()
 
-			if err := s.cli.Start(); err != nil {
+			if err := cli.Start(); err != nil {
 				slog.WarnContext(s.ctx, "failed to start websocket connection", "error", err)
 				goto retryConnecting
 			}
 			slog.InfoContext(s.ctx, "successfully connected to GARM", "server", s.cfg.ServerURL)
-			s.connected = make(chan struct{})
-			close(s.connecting)
+			s.connectionUp()
 		}
 	}
 }
 
 func (s *Service) loop() {
+	defer s.wg.Done()
 	heartbeatTicker := time.NewTicker(30 * time.Second)
 	defer func() {
 		slog.InfoContext(s.ctx, "daemon is shutting down")
@@ -638,38 +684,52 @@ func (s *Service) loop() {
 		heartbeatTicker.Stop()
 	}()
 
-connecting:
-	select {
-	case <-s.done:
-		return
-	case <-s.ctx.Done():
-		return
-	case <-s.connecting:
-	}
-	// send initial heartbeat
-	if id, alive, ok := s.snapshot(); ok {
-		if err := s.sendHeartbeat(id); err != nil {
-			slog.ErrorContext(s.ctx, "failed to send heartbeat", "error", err)
-		}
-		s.sendRunnerStatus(id, alive)
-	}
-
 	for {
+		// Wait until keepAliveLoop signals that a connection is up.
+		s.connMux.Lock()
+		connectingCh := s.connecting
+		s.connMux.Unlock()
 		select {
 		case <-s.done:
 			return
 		case <-s.ctx.Done():
 			return
-		case <-s.cli.Done():
-			slog.InfoContext(s.ctx, "remote host closed WS connection")
-			s.connecting = make(chan struct{})
-			close(s.connected)
-			goto connecting
-		case <-heartbeatTicker.C:
-			// send heartbeat
-			if id, _, ok := s.snapshot(); ok {
-				if err := s.sendHeartbeat(id); err != nil {
-					slog.ErrorContext(s.ctx, "failed to send heartbeat", "error", err)
+		case <-connectingCh:
+		}
+
+		cli, err := s.getClient()
+		if err != nil {
+			// Signalled connected but the client is gone; ask for a reconnect.
+			slog.ErrorContext(s.ctx, "no websocket client after connect", "error", err)
+			s.connectionDown()
+			continue
+		}
+
+		// send initial heartbeat
+		if id, alive, ok := s.snapshot(); ok {
+			if err := s.sendHeartbeat(id); err != nil {
+				slog.ErrorContext(s.ctx, "failed to send heartbeat", "error", err)
+			}
+			s.sendRunnerStatus(id, alive)
+		}
+
+		online := true
+		for online {
+			select {
+			case <-s.done:
+				return
+			case <-s.ctx.Done():
+				return
+			case <-cli.Done():
+				slog.InfoContext(s.ctx, "remote host closed WS connection")
+				s.connectionDown()
+				online = false
+			case <-heartbeatTicker.C:
+				// send heartbeat
+				if id, _, ok := s.snapshot(); ok {
+					if err := s.sendHeartbeat(id); err != nil {
+						slog.ErrorContext(s.ctx, "failed to send heartbeat", "error", err)
+					}
 				}
 			}
 		}
